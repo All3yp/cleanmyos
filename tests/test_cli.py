@@ -60,6 +60,19 @@ class TestCLI(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
+    def test_main_update_flag_calls_update_system(self):
+        old_argv = sys.argv
+        called = []
+        old_update = m.update_system
+        try:
+            m.update_system = lambda lang=None: called.append(lang)
+            sys.argv = ["cleanmyos", "--update"]
+            m.main()
+            self.assertEqual(len(called), 1)
+        finally:
+            sys.argv = old_argv
+            m.update_system = old_update
+
     def test_main_lang_flag_persists(self):
         import tempfile
         old_argv = sys.argv

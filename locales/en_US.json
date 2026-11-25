@@ -127,6 +127,12 @@
     "recently_used": "Recent Documents List",
     "fontconfig_cache": "Fontconfig Cache",
     "mesa_shader_cache": "Mesa Shader Cache",
-    "var_tmp": "/var/tmp Temporary Files"
+    "var_tmp": "/var/tmp Temporary Files",
+    "help_update": "Fetch updates from original repository and reinstall\n",
+    "updating": "Fetching updates from original repository ({url})...",
+    "already_latest": "✔ CleanMyOS is already up to date!",
+    "update_success": "✔ CleanMyOS successfully updated!",
+    "update_error": "✘ Failed to update: {err}",
+    "menu_u": "Update CleanMyOS (Original Repository)"
   }
 }

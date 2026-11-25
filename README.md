@@ -104,7 +104,15 @@ cleanmyos --lang en   # English
 cleanmyos --lang pt   # Portuguese
 ```
 
-### 6. Help
+### 6. Update CleanMyOS
+Fetches updates directly from the original upstream repository (even if using a fork) and reinstalls automatically:
+```bash
+cleanmyos --update
+# or from the repo:
+./update.sh
+```
+
+### 7. Help
 ```bash
 cleanmyos -h
 ```

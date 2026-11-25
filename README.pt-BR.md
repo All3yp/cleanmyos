@@ -105,7 +105,15 @@ cleanmyos --lang pt   # Português
 cleanmyos --lang en   # Inglês
 ```
 
-### 6. Ajuda
+### 6. Atualizar o CleanMyOS
+Busca novidades diretamente do repositório original (mesmo se você estiver usando um fork) e reinstala automaticamente:
+```bash
+cleanmyos --update
+# ou diretamente na pasta do projeto:
+./update.sh
+```
+
+### 7. Ajuda
 ```bash
 cleanmyos -h
 ```

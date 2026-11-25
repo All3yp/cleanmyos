@@ -19,6 +19,7 @@ CONFIG_DIR = HOME / ".config/cleanmyos"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 XDG_DATA_DIR = HOME / ".local/share/cleanmyos"
 XDG_LOCALES_DIR = XDG_DATA_DIR / "locales"
+ORIGINAL_REPO_URL = "https://github.com/All3yp/cleanmyos.git"
 
 DEFAULT_LARGE_FILE_MIN_MB = 500
 LARGE_FILE_SCAN_DIRS = ("Downloads", "Videos", "Documents", "Desktop")
@@ -601,9 +602,10 @@ class CleanMyOS:
                 console.print(f" [bold 7][/bold 7] {self.t('menu_7')}")
             console.print(f" [bold 8][/bold 8] {self.t('menu_8')}")
             console.print(f" [bold 9][/bold 9] {self.t('menu_9')}")
+            console.print(f" [bold u][/bold u] {self.t('menu_u')}")
             console.print(f" [bold 0][/bold 0] {self.t('menu_0')}")
 
-            choice = Prompt.ask(f"\n{self.t('menu_choice')}", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], default="5")
+            choice = Prompt.ask(f"\n{self.t('menu_choice')}", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "u", "U"], default="5")
 
             if choice == "0":
                 console.print(f"[green]{self.t('menu_exit')}[/green]")
@@ -646,6 +648,10 @@ class CleanMyOS:
                 self.switch_language()
                 self.scan_all()
                 self.print_dashboard()
+            elif choice in ["u", "U"]:
+                update_system(lang=self.lang)
+                self.scan_all()
+                self.print_dashboard()
 
 def print_help(lang: str = "pt_BR"):
     t_dict = load_locale_strings(lang)
@@ -660,6 +666,8 @@ def print_help(lang: str = "pt_BR"):
     panel_text.append(t_dict.get("help_l", ""), style="white")
     panel_text.append("  cleanmyos -y, --clean-all     ", style="bold green")
     panel_text.append(t_dict.get("help_y", ""), style="white")
+    panel_text.append("  cleanmyos -u, --update        ", style="bold green")
+    panel_text.append(t_dict.get("help_update", ""), style="white")
     panel_text.append("  cleanmyos --lang [pt|en]      ", style="bold green")
     panel_text.append(t_dict.get("help_lang", ""), style="white")
     panel_text.append("  cleanmyos --install           ", style="bold green")
@@ -669,6 +677,89 @@ def print_help(lang: str = "pt_BR"):
     panel_text.append(t_dict.get("help_tip", "💡 Tip: "), style="bold yellow")
     panel_text.append("cleanmyos -i\n", style="bold cyan")
     console.print(Panel(panel_text, border_style="cyan", box=box.ROUNDED))
+
+def update_system(lang: Optional[str] = None):
+    """Updates CleanMyOS by fetching from the original upstream repository and reinstalling."""
+    lang = lang or load_lang_preference()
+    strings = load_locale_strings(lang)
+    t = lambda k, **kw: strings.get(k, k).format(**kw) if kw else strings.get(k, k)
+
+    console.print(f"[cyan]{t('updating', url=ORIGINAL_REPO_URL)}[/cyan]")
+
+    repo_path = None
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                p = data.get("repo_path")
+                if p and Path(p).exists() and (Path(p) / ".git").exists():
+                    repo_path = Path(p)
+        except Exception:
+            pass
+
+    if not repo_path:
+        candidate = Path(__file__).resolve().parent
+        if (candidate / ".git").exists():
+            repo_path = candidate
+
+    if not repo_path:
+        fallback_repo = XDG_DATA_DIR / "repo"
+        if (fallback_repo / ".git").exists():
+            repo_path = fallback_repo
+        else:
+            try:
+                XDG_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                console.print(f"[dim]Clonando repositório para {fallback_repo}...[/dim]")
+                subprocess.run(["git", "clone", ORIGINAL_REPO_URL, str(fallback_repo)], check=True)
+                repo_path = fallback_repo
+            except Exception as e:
+                console.print(f"[red]{t('update_error', err=str(e))}[/red]")
+                return
+
+    try:
+        remotes_out = subprocess.run(
+            ["git", "-C", str(repo_path), "remote", "-v"],
+            stdout=subprocess.PIPE, text=True, check=True
+        ).stdout
+
+        target_remote = "origin"
+        if ORIGINAL_REPO_URL in remotes_out:
+            for line in remotes_out.splitlines():
+                if ORIGINAL_REPO_URL in line:
+                    target_remote = line.split()[0]
+                    break
+        else:
+            if "upstream" not in remotes_out:
+                subprocess.run(["git", "-C", str(repo_path), "remote", "add", "upstream", ORIGINAL_REPO_URL], check=True)
+            else:
+                subprocess.run(["git", "-C", str(repo_path), "remote", "set-url", "upstream", ORIGINAL_REPO_URL], check=True)
+            target_remote = "upstream"
+
+        subprocess.run(["git", "-C", str(repo_path), "fetch", target_remote, "main"], check=True)
+
+        local_head = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE, text=True, check=True
+        ).stdout.strip()
+
+        remote_head = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", f"{target_remote}/main"],
+            stdout=subprocess.PIPE, text=True, check=True
+        ).stdout.strip()
+
+        if local_head == remote_head:
+            console.print(f"[green]{t('already_latest')}[/green]")
+            return
+
+        subprocess.run(["git", "-C", str(repo_path), "pull", "--rebase", target_remote, "main"], check=True)
+
+        install_script = repo_path / "install.sh"
+        if install_script.exists():
+            subprocess.run([str(install_script), f"--lang={'en' if lang == 'en_US' else 'pt'}"], check=True)
+
+        console.print(f"[bold green]{t('update_success')}[/bold green]")
+    except Exception as e:
+        console.print(f"[red]{t('update_error', err=str(e))}[/red]")
 
 def install_system(lang: Optional[str] = None):
     """Installs CleanMyOS and its JSON locales to ~/.local and configures shell PATH."""
@@ -698,6 +789,20 @@ def install_system(lang: Optional[str] = None):
 
     if lang:
         save_lang_preference(lang)
+
+    try:
+        script_dir = Path(__file__).resolve().parent
+        if (script_dir / ".git").exists():
+            cfg = {}
+            if CONFIG_FILE.exists():
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            cfg["repo_path"] = str(script_dir)
+            cfg["upstream_url"] = ORIGINAL_REPO_URL
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
 
     console.print(f"[bold green]{t_dict.get('installed_to', 'CleanMyOS installed in: {bin}').format(bin=str(target_bin))}[/bold green]")
     console.print(f"[bold green]{t_dict.get('shortcut_created', 'Shortcut created: {symlink}').format(symlink=str(target_symlink))}[/bold green]")
@@ -788,6 +893,8 @@ def main():
         console.print(f"[green]{app.t('clean_auto_done')}[/green]")
     elif arg in ["--large", "-l"]:
         app.print_large_files()
+    elif arg in ["--update", "-u"]:
+        update_system(lang=current_lang)
     elif arg in ["--install"]:
         install_system(lang=current_lang)
     elif arg in ["--help", "-h"]:

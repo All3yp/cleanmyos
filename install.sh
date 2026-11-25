@@ -69,12 +69,14 @@ echo -e "${CYAN}        $(get_msg "header")       ${NC}"
 echo -e "${CYAN}==============================================${NC}"
 echo -e "${GREEN}[✔] $(get_msg "lang_selected")${NC}"
 
-# Save language preference to ~/.config/cleanmyos/config.json
+# Save language preference and repo path to ~/.config/cleanmyos/config.json
 CONFIG_DIR="$HOME/.config/cleanmyos"
 mkdir -p "$CONFIG_DIR"
 cat <<EOF > "$CONFIG_DIR/config.json"
 {
-  "lang": "$SELECTED_LANG"
+  "lang": "$SELECTED_LANG",
+  "repo_path": "$SCRIPT_DIR",
+  "upstream_url": "https://github.com/All3yp/cleanmyos.git"
 }
 EOF
 
