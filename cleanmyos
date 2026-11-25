@@ -1,0 +1,801 @@
+#!/usr/bin/env python3
+"""
+CleanMyOS (Linux Edition)
+A visual system cleaner, large file analyzer, and anti-stutter optimizer.
+Inspired by CleanMyMac, tailored for high-performance Linux desktop.
+Multilingual support powered by JSON locales.
+"""
+
+import os
+import sys
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config/cleanmyos"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+XDG_DATA_DIR = HOME / ".local/share/cleanmyos"
+XDG_LOCALES_DIR = XDG_DATA_DIR / "locales"
+
+DEFAULT_LARGE_FILE_MIN_MB = 500
+LARGE_FILE_SCAN_DIRS = ("Downloads", "Videos", "Documents", "Desktop")
+
+def get_locales_dir() -> Path:
+    """Finds the locales directory (local repo, XDG data, or system)."""
+    script_locales = Path(__file__).resolve().parent / "locales"
+    if script_locales.exists() and (script_locales / "pt_BR.json").exists():
+        return script_locales
+    if XDG_LOCALES_DIR.exists():
+        return XDG_LOCALES_DIR
+    sys_locales = Path("/usr/share/cleanmyos/locales")
+    if sys_locales.exists():
+        return sys_locales
+    return script_locales
+
+def load_lang_preference() -> str:
+    """Loads saved language from config file, or detects from system."""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                lang = data.get("lang")
+                if lang in ["pt_BR", "en_US"]:
+                    return lang
+        except Exception:
+            pass
+    sys_lang = os.environ.get("LANG", "").lower()
+    if sys_lang.startswith("pt"):
+        return "pt_BR"
+    return "en_US"
+
+def save_lang_preference(lang: str):
+    """Saves language preference to config file."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        data = {}
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data["lang"] = lang
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+def load_locale_strings(lang: str) -> Dict[str, str]:
+    """Loads translations from JSON file."""
+    locales_dir = get_locales_dir()
+    lang_file = locales_dir / f"{lang}.json"
+    if not lang_file.exists():
+        lang_file = locales_dir / "pt_BR.json"
+    if lang_file.exists():
+        try:
+            with open(lang_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("app", {})
+        except Exception:
+            pass
+    return {}
+
+# Determine language early for dependency messages
+INITIAL_LANG = load_lang_preference()
+for i, a in enumerate(sys.argv):
+    if a.startswith("--lang="):
+        INITIAL_LANG = "pt_BR" if "pt" in a.split("=", 1)[1].lower() else "en_US"
+    elif a == "--lang" and i + 1 < len(sys.argv):
+        INITIAL_LANG = "pt_BR" if "pt" in sys.argv[i + 1].lower() else "en_US"
+
+# Graceful dependency check for 'rich'
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    from rich.prompt import Prompt, Confirm
+    from rich.text import Text
+    from rich import box
+except ImportError:
+    if INITIAL_LANG == "pt_BR":
+        print("[!] Dependência 'rich' não encontrada.")
+        print("[*] Tentando instalar automaticamente via pip/uv...")
+    else:
+        print("[!] 'rich' dependency not found.")
+        print("[*] Attempting automatic installation via pip/uv...")
+    installed = False
+    for installer in [["python3", "-m", "pip", "install", "--user", "rich"], ["uv", "pip", "install", "--user", "rich"], ["pip", "install", "--user", "rich"]]:
+        try:
+            res = subprocess.run(installer, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                installed = True
+                break
+        except Exception:
+            continue
+    if installed:
+        if INITIAL_LANG == "pt_BR":
+            print("[✔] Dependência 'rich' instalada com sucesso! Reiniciando...")
+        else:
+            print("[✔] 'rich' dependency installed successfully! Restarting...")
+        os.execv(sys.executable, ['python3'] + sys.argv)
+    else:
+        if INITIAL_LANG == "pt_BR":
+            print("Erro: Instale com: pip install rich (ou sudo pacman -S python-rich / sudo apt install python3-rich)")
+        else:
+            print("Error: Install with: pip install rich (or sudo pacman -S python-rich / sudo apt install python3-rich)")
+        sys.exit(1)
+
+console = Console()
+
+def get_distro_info() -> Tuple[str, str, Optional[Path]]:
+    """Detects Linux distro pretty name, package manager, and package cache path."""
+    pretty_name = "Linux"
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    pretty_name = line.strip().split("=", 1)[1].strip('"\'')
+                    break
+    except Exception:
+        pass
+
+    if shutil.which("pacman"):
+        return pretty_name, "pacman", Path("/var/cache/pacman/pkg")
+    elif shutil.which("apt-get") or shutil.which("apt"):
+        return pretty_name, "apt", Path("/var/cache/apt/archives")
+    elif shutil.which("dnf"):
+        return pretty_name, "dnf", Path("/var/cache/dnf")
+    elif shutil.which("zypper"):
+        return pretty_name, "zypper", Path("/var/cache/zypp")
+    return pretty_name, "generic", None
+
+def get_dir_size(path: Path) -> int:
+    """Calculates size of directory in bytes quickly."""
+    if not path.exists():
+        return 0
+    try:
+        res = subprocess.run(
+            ["du", "-s", "-B1", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5
+        )
+        if res.returncode == 0:
+            return int(res.stdout.split()[0])
+    except Exception:
+        pass
+    
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat().st_size
+            elif entry.is_dir(follow_symlinks=False):
+                total += get_dir_size(Path(entry.path))
+    except (PermissionError, FileNotFoundError):
+        pass
+    return total
+
+def format_size(bytes_val: int) -> str:
+    """Converts bytes to readable string (KB, MB, GB, TB)."""
+    val = float(bytes_val)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if val < 1024.0 or unit == 'TB':
+            return f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{bytes_val} B"
+
+class CleanMyOS:
+    def __init__(self, lang: Optional[str] = None):
+        self.lang = lang or load_lang_preference()
+        self.strings = load_locale_strings(self.lang)
+        self.distro_name, self.pkg_manager, self.pkg_cache_path = get_distro_info()
+        self.refresh_strings()
+
+    def t(self, key: str, **kwargs) -> str:
+        """Translate helper using loaded JSON dictionary."""
+        text = self.strings.get(key, key)
+        if kwargs:
+            text = text.format(**kwargs)
+        return text
+
+    def refresh_strings(self):
+        """Builds junk categories with current language strings from JSON."""
+        self.strings = load_locale_strings(self.lang)
+        pkg_key = f"pkg_cache_{self.pkg_manager}"
+        pkg_name = self.t(pkg_key) if pkg_key in self.strings else self.t("pkg_cache_generic")
+
+        self.junk_categories: Dict[str, List[Dict[str, Any]]] = {
+            self.t("cat_trash"): [
+                {"name": self.t("trash"), "path": HOME / ".local/share/Trash", "safe": True, "type": "dir"},
+                {"name": self.t("thumbnails"), "path": HOME / ".cache/thumbnails", "safe": True, "type": "dir"},
+                {"name": self.t("recently_used"), "path": HOME / ".local/share/RecentDocuments", "safe": True, "type": "dir"},
+            ],
+            self.t("cat_dev"): [
+                {"name": "Pip Cache (Python)", "path": HOME / ".cache/pip", "safe": True, "type": "dir"},
+                {"name": "UV Cache (Python)", "path": HOME / ".cache/uv", "safe": True, "type": "dir"},
+                {"name": "Pre-commit Cache", "path": HOME / ".cache/pre-commit", "safe": True, "type": "dir"},
+                {"name": "Go Build Cache", "path": HOME / ".cache/go-build", "safe": True, "type": "dir"},
+                {"name": "PNPM Store Cache", "path": HOME / ".cache/pnpm", "safe": True, "type": "dir"},
+                {"name": "Yarn Cache", "path": HOME / ".cache/yarn", "safe": True, "type": "dir"},
+                {"name": "Bun Cache", "path": HOME / ".bun/install/cache", "safe": True, "type": "dir"},
+                {"name": "NPM Cache", "path": HOME / ".npm/_cacache", "safe": True, "type": "dir"},
+                {"name": "Rust / Cargo Registry Cache", "path": HOME / ".cargo/registry/cache", "safe": True, "type": "dir"},
+                {"name": "Rust / Cargo Git DB", "path": HOME / ".cargo/git/db", "safe": True, "type": "dir"},
+                {"name": "Gradle Cache", "path": HOME / ".gradle/caches", "safe": True, "type": "dir"},
+                {"name": "Maven Cache", "path": HOME / ".m2/repository", "safe": True, "type": "dir"},
+                {"name": "Composer Cache", "path": HOME / ".cache/composer", "safe": True, "type": "dir"},
+                {"name": "Shelly Cache", "path": HOME / ".cache/Shelly", "safe": True, "type": "dir"},
+                {"name": "Codex Runtimes Cache", "path": HOME / ".cache/codex-runtimes", "safe": True, "type": "dir"},
+                {"name": "VS Code C++ Tools Cache", "path": HOME / ".cache/vscode-cpptools", "safe": True, "type": "dir"},
+                {"name": "GitHub Copilot Cache", "path": HOME / ".cache/copilot", "safe": True, "type": "dir"},
+                {"name": "TypeScript Cache", "path": HOME / ".cache/typescript", "safe": True, "type": "dir"},
+            ],
+            self.t("cat_browsers"): [
+                {"name": "Microsoft Edge Cache", "path": HOME / ".cache/microsoft-edge", "safe": True, "type": "dir"},
+                {"name": "Waterfox Cache", "path": HOME / ".cache/waterfox", "safe": True, "type": "dir"},
+                {"name": "Mozilla Firefox Cache", "path": HOME / ".cache/mozilla", "safe": True, "type": "dir"},
+                {"name": "Google Chrome Cache", "path": HOME / ".cache/google-chrome", "safe": True, "type": "dir"},
+                {"name": "Chromium Cache", "path": HOME / ".cache/chromium", "safe": True, "type": "dir"},
+                {"name": "Brave Browser Cache", "path": HOME / ".cache/BraveSoftware", "safe": True, "type": "dir"},
+                {"name": "Vivaldi Cache", "path": HOME / ".cache/vivaldi", "safe": True, "type": "dir"},
+                {"name": "Opera Cache", "path": HOME / ".cache/opera", "safe": True, "type": "dir"},
+            ],
+            self.t("cat_system"): [
+                {"name": pkg_name, "path": self.pkg_cache_path, "safe": False, "type": "pkg_manager"},
+                {"name": self.t("flatpak_unused"), "path": None, "safe": True, "type": "flatpak"},
+                {"name": self.t("journal_logs"), "path": None, "safe": True, "type": "journal"},
+                {"name": self.t("coredump"), "path": Path("/var/lib/systemd/coredump"), "safe": True, "type": "dir"},
+                {"name": self.t("docker_cache"), "path": None, "safe": False, "type": "docker"},
+                {"name": self.t("fontconfig_cache"), "path": HOME / ".cache/fontconfig", "safe": True, "type": "dir"},
+                {"name": self.t("mesa_shader_cache"), "path": HOME / ".cache/mesa_shader_cache", "safe": True, "type": "dir"},
+                {"name": self.t("var_tmp"), "path": Path("/var/tmp"), "safe": False, "type": "dir"},
+            ]
+        }
+        self.scanned_data: Dict[str, Any] = {}
+
+    def scan_all(self):
+        """Scans all junk items and measures their size."""
+        with Progress(
+            SpinnerColumn("dots", style="cyan"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=30, style="magenta", complete_style="green"),
+            console=console,
+            transient=True
+        ) as progress:
+            total_items = sum(len(items) for items in self.junk_categories.values())
+            task = progress.add_task(f"[bold cyan]{self.t('scan_desc')}", total=total_items)
+            
+            self.scanned_data = {}
+            grand_total = 0
+
+            for cat, items in self.junk_categories.items():
+                self.scanned_data[cat] = []
+                for item in items:
+                    progress.update(task, description=f"[cyan]{self.t('checking', item=item['name'])}")
+                    size = 0
+                    if item.get("path") and item["path"].exists():
+                        size = get_dir_size(item["path"])
+                    elif item.get("type") == "journal":
+                        try:
+                            res = subprocess.run(["journalctl", "--disk-usage"], stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+                            for part in res.stdout.split():
+                                if part.endswith("M") or part.endswith("G") or part.endswith("K"):
+                                    if part.endswith("M"): size = int(float(part[:-1]) * 1024 * 1024)
+                                    elif part.endswith("G"): size = int(float(part[:-1]) * 1024 * 1024 * 1024)
+                                    break
+                        except Exception:
+                            pass
+                    elif item.get("type") == "flatpak" and shutil.which("flatpak"):
+                        try:
+                            res = subprocess.run(["flatpak", "uninstall", "--unused", "--assumeyes", "--dry-run"], stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+                            if "Nothing to do" not in res.stdout and len(res.stdout.strip()) > 0:
+                                size = 500 * 1024 * 1024
+                        except Exception:
+                            pass
+                    elif item.get("type") == "docker" and shutil.which("docker"):
+                        try:
+                            res = subprocess.run(["docker", "system", "df", "--format", "{{.Reclaimable}}"], stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+                            for line in res.stdout.splitlines():
+                                parts = line.split()
+                                if parts:
+                                    val_str = parts[0]
+                                    if "GB" in val_str: size += int(float(val_str.replace("GB", "")) * 1024 * 1024 * 1024)
+                                    elif "MB" in val_str: size += int(float(val_str.replace("MB", "")) * 1024 * 1024)
+                        except Exception:
+                            pass
+
+                    item_copy = dict(item)
+                    item_copy["size"] = size
+                    self.scanned_data[cat].append(item_copy)
+                    grand_total += size
+                    progress.advance(task)
+
+            self.scanned_data["_grand_total"] = grand_total
+
+    def _impact_label(self, item: Dict[str, Any]) -> str:
+        if not item.get("safe", True):
+            return f"[yellow]{self.t('impact_packages')}[/yellow]"
+        if item.get("type") in {"journal", "coredump"}:
+            return f"[blue]{self.t('impact_logs')}[/blue]"
+        if item.get("type") == "dir":
+            return f"[green]{self.t('impact_cache')}[/green]"
+        return f"[green]{self.t('impact_safe')}[/green]"
+
+    def print_dashboard(self):
+        """Renders the CleanMyMac style terminal dashboard."""
+        grand_total = self.scanned_data.get("_grand_total", 0)
+        non_empty_categories = 0
+        non_empty_items = 0
+        for cat, items in self.scanned_data.items():
+            if cat == "_grand_total":
+                continue
+            cat_items = [i for i in items if i.get("size", 0) > 0]
+            if cat_items:
+                non_empty_categories += 1
+                non_empty_items += len(cat_items)
+
+        console.clear()
+        banner = Text()
+        banner.append(self.t("title") + " ", style="bold magenta")
+        banner.append(self.t("subtitle", distro=self.distro_name), style="bold cyan")
+        banner.append(self.t("reclaimable"), style="dim")
+        banner.append(f"{format_size(grand_total)}\n", style="bold green")
+        banner.append(f"{self.t('summary_categories')}: ", style="dim")
+        banner.append(f"{non_empty_categories}  ", style="bold white")
+        banner.append(f"{self.t('summary_items')}: ", style="dim")
+        banner.append(f"{non_empty_items}", style="bold white")
+        console.print(Panel(banner, border_style="cyan", box=box.ROUNDED, title=f"[bold cyan]{self.t('summary_title')}[/bold cyan]"))
+
+        table = Table(
+            title=f"[bold yellow]{self.t('tbl_title')}[/bold yellow]",
+            box=box.ROUNDED,
+            expand=True,
+            show_lines=False,
+            header_style="bold white on dark_blue",
+            row_styles=["none", "dim"],
+        )
+        table.add_column(self.t("tbl_category"), style="bold cyan", no_wrap=True, width=24)
+        table.add_column(self.t("tbl_item"), style="white", overflow="fold")
+        table.add_column(self.t("tbl_size"), justify="right", style="bold green", width=12)
+        table.add_column(self.t("tbl_impact"), style="dim", width=30)
+
+        has_rows = False
+        for cat in self.junk_categories.keys():
+            items = self.scanned_data.get(cat, [])
+            visible = [i for i in items if i.get("size", 0) > 0]
+            if not visible:
+                continue
+            has_rows = True
+            cat_total = sum(i.get("size", 0) for i in visible)
+            for idx, item in enumerate(visible):
+                cat_col = f"[bold cyan]{cat}[/bold cyan]" if idx == 0 else ""
+                size = item.get("size", 0)
+                table.add_row(cat_col, item["name"], f"[bold green]{format_size(size)}[/bold green]", self._impact_label(item))
+            table.add_row(
+                "",
+                f"[dim italic]{self.t('cat_total')}[/dim italic]",
+                f"[bold yellow]{format_size(cat_total)}[/bold yellow]",
+                "",
+                end_section=True,
+            )
+
+        if not has_rows:
+            console.print(Panel(f"[green]{self.t('no_junk')}[/green]", border_style="green", box=box.ROUNDED))
+            return
+
+        console.print(table)
+
+    def scan_large_files(self, min_size_mb: int = DEFAULT_LARGE_FILE_MIN_MB) -> List[Tuple[str, int, str]]:
+        """Finds files larger than min_size_mb in user directories."""
+        large_files: List[Tuple[str, int, str]] = []
+        scan_paths = [HOME / name for name in LARGE_FILE_SCAN_DIRS]
+
+        with Progress(
+            SpinnerColumn("dots", style="yellow"),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"[yellow]{self.t('large_scanning')}", total=len(scan_paths))
+            min_bytes = min_size_mb * 1024 * 1024
+
+            for folder in scan_paths:
+                progress.update(task, description=f"[yellow]{folder.name}...")
+                if not folder.exists():
+                    progress.advance(task)
+                    continue
+                try:
+                    for root, _, files in os.walk(folder):
+                        for f in files:
+                            fpath = Path(root) / f
+                            try:
+                                if not fpath.is_symlink():
+                                    st = fpath.stat()
+                                    if st.st_size >= min_bytes:
+                                        large_files.append((str(fpath), st.st_size, folder.name))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                progress.advance(task)
+
+        large_files.sort(key=lambda x: x[1], reverse=True)
+        return large_files
+
+    def print_large_files(self, min_size_mb: int = DEFAULT_LARGE_FILE_MIN_MB):
+        """Displays large files table."""
+        files = self.scan_large_files(min_size_mb)
+        if not files:
+            console.print(Panel(f"[green]{self.t('large_none')}[/green]", border_style="green", box=box.ROUNDED))
+            return
+
+        total_size = sum(size for _, size, _ in files)
+        header = Text()
+        header.append(f"{self.t('large_count')}: ", style="dim")
+        header.append(f"{len(files)}  ", style="bold white")
+        header.append(f"{self.t('large_total')}: ", style="dim")
+        header.append(format_size(total_size), style="bold red")
+        console.print(Panel(header, border_style="red", box=box.ROUNDED, title=f"[bold red]{self.t('large_title')}[/bold red]"))
+
+        table = Table(box=box.ROUNDED, expand=True, header_style="bold white on dark_red", row_styles=["none", "dim"])
+        table.add_column("#", justify="right", style="dim", width=4)
+        table.add_column(self.t("large_folder"), style="bold cyan", width=14)
+        table.add_column(self.t("large_path"), style="white", overflow="fold")
+        table.add_column(self.t("tbl_size"), justify="right", style="bold red", width=12)
+
+        for idx, (path_str, size, folder) in enumerate(files[:12], start=1):
+            display_path = path_str.replace(str(HOME), "~")
+            size_style = "bold red" if size >= 1024 ** 3 else "bold yellow"
+            table.add_row(str(idx), folder, display_path, f"[{size_style}]{format_size(size)}[/{size_style}]")
+
+        console.print(table)
+
+    def print_anti_stutter_tips(self):
+        """Displays performance & anti-stutter diagnostics."""
+        panel_content = Text()
+        panel_content.append(self.t("anti_stutter_title"), style="bold yellow")
+
+        # 1. GPU Check
+        gpu_mode = "Desconhecido" if self.lang == "pt_BR" else "Unknown"
+        if shutil.which("supergfxctl"):
+            try:
+                res = subprocess.run(["supergfxctl", "-g"], stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+                gpu_mode = res.stdout.strip()
+            except Exception:
+                pass
+
+        if gpu_mode == "Hybrid":
+            panel_content.append(self.t("gpu_hybrid"), style="bold red")
+        elif gpu_mode not in ["Desconhecido", "Unknown"]:
+            panel_content.append(self.t("gpu_optimized", mode=gpu_mode), style="bold green")
+
+        # 2. Ananicy CPP (Anti-stutter)
+        if shutil.which("ananicy-cpp"):
+            ananicy_active = False
+            try:
+                res = subprocess.run(["systemctl", "is-active", "ananicy-cpp"], stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+                ananicy_active = res.stdout.strip() == "active"
+            except Exception:
+                pass
+
+            if ananicy_active:
+                panel_content.append(self.t("ananicy_active"), style="bold green")
+            else:
+                panel_content.append(self.t("ananicy_inactive"), style="bold red")
+
+        # 3. Sched-ext (SCX Kernel Scheduler, se disponível)
+        if shutil.which("scx_loader") or subprocess.run(["systemctl", "status", "scx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            scx_active = False
+            try:
+                res = subprocess.run(["systemctl", "is-active", "scx"], stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+                scx_active = res.stdout.strip() == "active"
+            except Exception:
+                pass
+            status_str = self.t("status_active") if scx_active else self.t("status_inactive")
+            panel_content.append(self.t("scx_status", status=status_str), style="bold cyan")
+
+        # 4. SSD Trim
+        fstrim_active = False
+        try:
+            res = subprocess.run(["systemctl", "is-active", "fstrim.timer"], stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+            fstrim_active = res.stdout.strip() == "active"
+        except Exception:
+            pass
+        status_trim = self.t("status_active") if fstrim_active else self.t("status_inactive")
+        panel_content.append(self.t("ssd_trim", status=status_trim), style="bold green" if fstrim_active else "bold red")
+
+        # 5. Btrfs Snapper check
+        if shutil.which("snapper"):
+            panel_content.append(self.t("snapper_info"), style="bold cyan")
+
+        console.print(Panel(panel_content, border_style="yellow", box=box.ROUNDED))
+
+    def clean_category(self, cat_name: str):
+        """Cleans a specific category."""
+        items = self.scanned_data.get(cat_name, [])
+        freed = 0
+        for item in items:
+            p = item.get("path")
+            if p and p.exists() and item.get("type") == "dir":
+                size = item.get("size", 0)
+                try:
+                    for child in p.iterdir():
+                        if child.is_file() or child.is_symlink():
+                            child.unlink()
+                        elif child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                    freed += size
+                    console.print(f"[green]{self.t('cleaned_item', item=item['name'], size=format_size(size))}[/green]")
+                except PermissionError:
+                    console.print(f"[yellow]{self.t('root_needed', item=item['name'])}[/yellow]")
+                    subprocess.run(["sudo", "rm", "-rf", f"{str(p)}/*"], stderr=subprocess.DEVNULL)
+                except Exception as e:
+                    console.print(f"[red]{self.t('clean_fail', item=item['name'], err=e)}[/red]")
+            elif item.get("type") == "pkg_manager":
+                self.clean_package_cache()
+            elif item.get("type") == "journal":
+                try:
+                    subprocess.run(["journalctl", "--vacuum-size=100M"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    console.print(f"[green]{self.t('clean_logs')}[/green]")
+                except Exception:
+                    pass
+            elif item.get("type") == "flatpak":
+                try:
+                    subprocess.run(["flatpak", "uninstall", "--unused", "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    console.print(f"[green]{self.t('clean_flatpak')}[/green]")
+                except Exception:
+                    pass
+            elif item.get("type") == "docker" and shutil.which("docker"):
+                try:
+                    subprocess.run(["docker", "system", "prune", "-f"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    console.print(f"[green]{self.t('clean_docker')}[/green]")
+                except Exception:
+                    pass
+        return freed
+
+    def clean_package_cache(self):
+        """Cleans package manager cache according to detected distro."""
+        console.print(f"[yellow]{self.t('clean_pkg_cleaning', pkg=self.pkg_manager.upper())}[/yellow]")
+        if self.pkg_manager == "pacman":
+            if shutil.which("paccache"):
+                res = subprocess.run(["paccache", "-rk1"], stdout=subprocess.PIPE, text=True)
+                console.print(f"[green]{res.stdout.strip()}[/green]")
+            elif shutil.which("yay"):
+                subprocess.run(["yay", "-Sc", "--noconfirm"])
+            else:
+                subprocess.run(["sudo", "pacman", "-Sc", "--noconfirm"])
+        elif self.pkg_manager == "apt":
+            subprocess.run(["sudo", "apt-get", "clean"])
+            subprocess.run(["sudo", "apt-get", "autoremove", "-y"])
+        elif self.pkg_manager == "dnf":
+            subprocess.run(["sudo", "dnf", "clean", "all"])
+        elif self.pkg_manager == "zypper":
+            subprocess.run(["sudo", "zypper", "clean"])
+        console.print(f"[green]{self.t('clean_pkg_done')}[/green]")
+
+    def switch_language(self):
+        """Toggles between pt_BR and en_US."""
+        self.lang = "en_US" if self.lang == "pt_BR" else "pt_BR"
+        save_lang_preference(self.lang)
+        self.refresh_strings()
+        console.print(f"[green]{self.t('lang_switched')}[/green]")
+
+    def run_interactive(self):
+        """Main interactive loop."""
+        self.scan_all()
+        self.print_dashboard()
+        self.print_anti_stutter_tips()
+
+        while True:
+            console.print(f"\n[bold cyan]{self.t('menu_prompt')}[/bold cyan]")
+            console.print(f" [bold 1][/bold 1] {self.t('menu_1')}")
+            console.print(f" [bold 2][/bold 2] {self.t('menu_2')}")
+            console.print(f" [bold 3][/bold 3] {self.t('menu_3')}")
+            console.print(f" [bold 4][/bold 4] {self.t('menu_4', pkg=self.pkg_manager.upper())}")
+            console.print(f" [bold 5][/bold 5] {self.t('menu_5')}")
+            console.print(f" [bold 6][/bold 6] {self.t('menu_6')}")
+            if shutil.which("supergfxctl"):
+                console.print(f" [bold 7][/bold 7] {self.t('menu_7')}")
+            console.print(f" [bold 8][/bold 8] {self.t('menu_8')}")
+            console.print(f" [bold 9][/bold 9] {self.t('menu_9')}")
+            console.print(f" [bold 0][/bold 0] {self.t('menu_0')}")
+
+            choice = Prompt.ask(f"\n{self.t('menu_choice')}", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], default="5")
+
+            if choice == "0":
+                console.print(f"[green]{self.t('menu_exit')}[/green]")
+                break
+            elif choice == "1":
+                self.clean_category(self.t("cat_trash"))
+                self.scan_all()
+                self.print_dashboard()
+            elif choice == "2":
+                self.clean_category(self.t("cat_dev"))
+                self.scan_all()
+                self.print_dashboard()
+            elif choice == "3":
+                self.clean_category(self.t("cat_browsers"))
+                self.scan_all()
+                self.print_dashboard()
+            elif choice == "4":
+                self.clean_package_cache()
+                self.scan_all()
+                self.print_dashboard()
+            elif choice == "5":
+                if Confirm.ask(self.t("confirm_clean_all")):
+                    self.clean_category(self.t("cat_trash"))
+                    self.clean_category(self.t("cat_dev"))
+                    self.clean_category(self.t("cat_browsers"))
+                    self.clean_category(self.t("cat_system"))
+                    self.scan_all()
+                    self.print_dashboard()
+            elif choice == "6":
+                self.print_large_files()
+            elif choice == "7" and shutil.which("supergfxctl"):
+                console.print(f"[yellow]{self.t('gpu_switching')}[/yellow]")
+                subprocess.run(["supergfxctl", "-m", "Integrated"])
+                console.print(f"[green]{self.t('gpu_switched')}[/green]")
+            elif choice == "8":
+                self.scan_all()
+                self.print_dashboard()
+                self.print_anti_stutter_tips()
+            elif choice == "9":
+                self.switch_language()
+                self.scan_all()
+                self.print_dashboard()
+
+def print_help(lang: str = "pt_BR"):
+    t_dict = load_locale_strings(lang)
+    panel_text = Text()
+    panel_text.append(t_dict.get("help_title", "🧹 CleanMyOS\n\n"), style="bold cyan")
+    panel_text.append(t_dict.get("help_usage", "Usage:\n"), style="bold yellow")
+    panel_text.append("  cleanmyos -i, --interactive   ", style="bold green")
+    panel_text.append(t_dict.get("help_i", ""), style="white")
+    panel_text.append("  cleanmyos -s, --scan          ", style="bold green")
+    panel_text.append(t_dict.get("help_s", ""), style="white")
+    panel_text.append("  cleanmyos -l, --large         ", style="bold green")
+    panel_text.append(t_dict.get("help_l", ""), style="white")
+    panel_text.append("  cleanmyos -y, --clean-all     ", style="bold green")
+    panel_text.append(t_dict.get("help_y", ""), style="white")
+    panel_text.append("  cleanmyos --lang [pt|en]      ", style="bold green")
+    panel_text.append(t_dict.get("help_lang", ""), style="white")
+    panel_text.append("  cleanmyos --install           ", style="bold green")
+    panel_text.append(t_dict.get("help_install", ""), style="white")
+    panel_text.append("  cleanmyos -h, --help          ", style="bold green")
+    panel_text.append(t_dict.get("help_h", ""), style="white")
+    panel_text.append(t_dict.get("help_tip", "💡 Tip: "), style="bold yellow")
+    panel_text.append("cleanmyos -i\n", style="bold cyan")
+    console.print(Panel(panel_text, border_style="cyan", box=box.ROUNDED))
+
+def install_system(lang: Optional[str] = None):
+    """Installs CleanMyOS and its JSON locales to ~/.local and configures shell PATH."""
+    lang = lang or load_lang_preference()
+    t_dict = load_locale_strings(lang)
+
+    target_bin_dir = HOME / ".local/bin"
+    target_bin_dir.mkdir(parents=True, exist_ok=True)
+    target_bin = target_bin_dir / "cleanmyos"
+    target_symlink = target_bin_dir / "clean"
+    
+    current_script = Path(__file__).resolve()
+    if current_script != target_bin:
+        shutil.copy2(current_script, target_bin)
+    
+    target_bin.chmod(0o755)
+    if target_symlink.exists() or target_symlink.is_symlink():
+        target_symlink.unlink()
+    target_symlink.symlink_to(target_bin)
+    
+    # Copy locales to ~/.local/share/cleanmyos/locales/
+    src_locales = get_locales_dir()
+    if src_locales.exists():
+        XDG_LOCALES_DIR.mkdir(parents=True, exist_ok=True)
+        for loc in src_locales.glob("*.json"):
+            shutil.copy2(loc, XDG_LOCALES_DIR / loc.name)
+
+    if lang:
+        save_lang_preference(lang)
+
+    console.print(f"[bold green]{t_dict.get('installed_to', 'CleanMyOS installed in: {bin}').format(bin=str(target_bin))}[/bold green]")
+    console.print(f"[bold green]{t_dict.get('shortcut_created', 'Shortcut created: {symlink}').format(symlink=str(target_symlink))}[/bold green]")
+    
+    user_shell = os.environ.get("SHELL", "")
+    shell_name = Path(user_shell).name if user_shell else "bash"
+    str_target = str(target_bin_dir)
+
+    configured = False
+    if shell_name == "fish":
+        fish_config = HOME / ".config/fish/config.fish"
+        if fish_config.exists():
+            content = fish_config.read_text()
+            if str_target not in content:
+                with open(fish_config, "a") as f:
+                    f.write(f"\n# CleanMyOS PATH\nfish_add_path {str_target}\n")
+                console.print(f"[green]{t_dict.get('added_to_shell', 'Added to {shell}: {config}').format(shell='Fish Shell', config=str(fish_config))}[/green]")
+            configured = True
+    elif shell_name == "zsh":
+        zsh_config = HOME / ".zshrc"
+        if zsh_config.exists():
+            content = zsh_config.read_text()
+            if str_target not in content:
+                with open(zsh_config, "a") as f:
+                    f.write(f'\n# CleanMyOS PATH\nexport PATH="{str_target}:$PATH"\n')
+                console.print(f"[green]{t_dict.get('added_to_shell', 'Added to {shell}: {config}').format(shell='Zsh', config=str(zsh_config))}[/green]")
+            configured = True
+    elif shell_name == "bash":
+        bash_config = HOME / ".bashrc"
+        if bash_config.exists():
+            content = bash_config.read_text()
+            if str_target not in content:
+                with open(bash_config, "a") as f:
+                    f.write(f'\n# CleanMyOS PATH\nexport PATH="{str_target}:$PATH"\n')
+                console.print(f"[green]{t_dict.get('added_to_shell', 'Added to {shell}: {config}').format(shell='Bash', config=str(bash_config))}[/green]")
+            configured = True
+
+    if not configured:
+        profile = HOME / ".profile"
+        if profile.exists():
+            content = profile.read_text()
+            if str_target not in content:
+                with open(profile, "a") as f:
+                    f.write(f'\n# CleanMyOS PATH\nexport PATH="{str_target}:$PATH"\n')
+                console.print(f"[green]{t_dict.get('added_to_profile', 'Added to ~/.profile')}[/green]")
+
+    console.print(f"[bold green]{t_dict.get('install_success', 'Installation finished successfully!')}[/bold green]")
+
+def main():
+    current_lang = load_lang_preference()
+    
+    # Check for --lang argument in sys.argv
+    for i, a in enumerate(sys.argv):
+        if a.startswith("--lang="):
+            val = a.split("=", 1)[1].lower()
+            current_lang = "pt_BR" if "pt" in val else "en_US"
+            save_lang_preference(current_lang)
+            sys.argv.pop(i)
+            break
+        elif a == "--lang" and i + 1 < len(sys.argv):
+            val = sys.argv[i + 1].lower()
+            current_lang = "pt_BR" if "pt" in val else "en_US"
+            save_lang_preference(current_lang)
+            sys.argv.pop(i + 1)
+            sys.argv.pop(i)
+            break
+
+    app = CleanMyOS(lang=current_lang)
+
+    if len(sys.argv) == 1:
+        print_help(lang=current_lang)
+        return
+
+    arg = sys.argv[1].lower()
+    if arg in ["--interactive", "-i", "--ui"]:
+        app.run_interactive()
+    elif arg in ["--scan", "-s"]:
+        app.scan_all()
+        app.print_dashboard()
+        app.print_anti_stutter_tips()
+        app.print_large_files()
+    elif arg in ["--clean-all", "-y"]:
+        app.scan_all()
+        app.clean_category(app.t("cat_trash"))
+        app.clean_category(app.t("cat_dev"))
+        app.clean_category(app.t("cat_browsers"))
+        app.clean_category(app.t("cat_system"))
+        console.print(f"[green]{app.t('clean_auto_done')}[/green]")
+    elif arg in ["--large", "-l"]:
+        app.print_large_files()
+    elif arg in ["--install"]:
+        install_system(lang=current_lang)
+    elif arg in ["--help", "-h"]:
+        print_help(lang=current_lang)
+    else:
+        err_msg = app.t("unknown_option", arg=arg)
+        console.print(f"[red]{err_msg}[/red]")
+        print_help(lang=current_lang)
+
+if __name__ == "__main__":
+    main()
